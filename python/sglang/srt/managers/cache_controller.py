@@ -260,6 +260,9 @@ class HiCacheController:
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
+        # Delay init kv buffer if storage backend is enabled
+        if storage_backend is None:
+            self.mem_pool_host.init_kv_buffer()
         self.write_policy = write_policy
         self.page_size = page_size
         self.io_backend = io_backend
@@ -290,6 +293,11 @@ class HiCacheController:
             except ValueError as e:
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
+            self.mem_pool_host.init_kv_buffer(
+                self.storage_backend.alloc_from_mem_pool(
+                    self.mem_pool_host.size * self.mem_pool_host.size_per_token
+                )
+            )
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True

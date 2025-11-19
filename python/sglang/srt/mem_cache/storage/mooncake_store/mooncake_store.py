@@ -53,6 +53,8 @@ class MooncakeStoreConfig:
     master_server_address: str
     master_metrics_port: int
     check_server: bool
+    standalone_storage: bool
+    client_server_address: str
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -64,6 +66,10 @@ class MooncakeStoreConfig:
         except Exception as e:
             raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
 
+        # Check if either master_server_address or client_server_address is provided
+        if not config.get("master_server_address") and not config.get("client_server_address"):
+            raise ValueError("Either 'master_server_address' or 'client_server_address' is required in config file")
+
         return MooncakeStoreConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
@@ -74,11 +80,13 @@ class MooncakeStoreConfig:
             local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
-            master_server_address=config.get("master_server_address"),
+            master_server_address=config.get("master_server_address", ""),
             master_metrics_port=config.get(
                 "master_metrics_port", DEFAULT_MASTER_METRICS_PORT
             ),
             check_server=config.get("check_server", DEFAULT_CHECK_SERVER),
+            standalone_storage=config.get("standalone_storage", False),
+            client_server_address=config.get("client_server_address", ""),
         )
 
     @staticmethod
@@ -90,8 +98,8 @@ class MooncakeStoreConfig:
         export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
         """
         # other required environment variables...
-        if not os.getenv("MOONCAKE_MASTER"):
-            raise ValueError("The environment variable 'MOONCAKE_MASTER' is not set.")
+        if not os.getenv("MOONCAKE_MASTER") and not os.getenv("MOONCAKE_CLIENT"):
+            raise ValueError("Either 'MOONCAKE_MASTER' or 'MOONCAKE_CLIENT' environment variable is required.")
         return MooncakeStoreConfig(
             local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
             metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
@@ -102,18 +110,20 @@ class MooncakeStoreConfig:
             local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE", ""),
-            master_server_address=os.getenv("MOONCAKE_MASTER"),
+            master_server_address=os.getenv("MOONCAKE_MASTER", ""),
             master_metrics_port=int(
                 os.getenv("MOONCAKE_MASTER_METRICS_PORT", DEFAULT_MASTER_METRICS_PORT)
             ),
             check_server=bool(os.getenv("MOONCAKE_CHECK_SERVER", DEFAULT_CHECK_SERVER)),
+            standalone_storage=bool(os.getenv("MOONCAKE_STANDALONE_STORAGE", False)),
+            client_server_address=os.getenv("MOONCAKE_CLIENT", ""),
         )
 
     @staticmethod
     def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
         """Load config from extra_config dictionary."""
-        if "master_server_address" not in extra_config:
-            raise ValueError("master_server_address is required in extra_config")
+        if "master_server_address" not in extra_config and "client_server_address" not in extra_config:
+            raise ValueError("Either master_server_address or is client_server_address required in extra_config")
 
         return MooncakeStoreConfig(
             local_hostname=extra_config.get("local_hostname", "localhost"),
@@ -126,17 +136,19 @@ class MooncakeStoreConfig:
             ),
             protocol=extra_config.get("protocol", "tcp"),
             device_name=extra_config.get("device_name", ""),
-            master_server_address=extra_config["master_server_address"],
+            master_server_address=extra_config.get("master_server_address", ""),
             master_metrics_port=extra_config.get(
                 "master_metrics_port", DEFAULT_MASTER_METRICS_PORT
             ),
             check_server=extra_config.get("check_server", DEFAULT_CHECK_SERVER),
+            standalone_storage=extra_config.get("standalone_storage", False),
+            client_server_address=extra_config.get("client_server_address", ""),
         )
 
 
 class MooncakeStore(HiCacheStorage):
 
-    def __init__(self, storage_config: HiCacheStorageConfig = None):
+    def __init__(self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None):
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
@@ -157,7 +169,8 @@ class MooncakeStore(HiCacheStorage):
             # Load configuration with master_server_address prioritized from extra_config if available
             if (
                 extra_config is not None
-                and extra_config.get("master_server_address") is not None
+                and (extra_config.get("master_server_address") is not None
+                or extra_config.get("client_server_address") is not None)
             ):
                 # Load from extra_config
                 self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
@@ -190,15 +203,40 @@ class MooncakeStore(HiCacheStorage):
             if self.config.check_server:
                 self.check_server()
 
-            ret_code = self.store.setup(
-                self.config.local_hostname,
-                self.config.metadata_server,
-                per_tp_global_segment_size,
-                per_tp_local_buffer_size,
-                self.config.protocol,
-                self.config.device_name,
-                self.config.master_server_address,
-            )
+            # Handle JSON device_name configuration
+            device_name = self.config.device_name
+            if device_name and device_name.strip().startswith("{"):
+                try:
+                    device_config = json.loads(device_name)
+                    if storage_config and hasattr(storage_config, "tp_rank"):
+                        tp_rank = storage_config.tp_rank
+                        # Try both integer and string keys since JSON parsing may convert keys
+                        device_name = device_config.get(tp_rank, "")
+                        if not device_name:
+                            device_name = device_config.get(str(tp_rank), "")
+                    else:
+                        device_name = ""
+                except (json.JSONDecodeError, AttributeError):
+                    logger.warning(
+                        f"Failed to parse device_name as JSON: {device_name}"
+                    )
+                    device_name = ""
+            if self.config.standalone_storage:
+                ret_code = self.store.setup_dummy(
+                    mem_pool.size * mem_pool.size_per_token,
+                    per_tp_local_buffer_size,
+                    self.config.client_server_address,
+                )
+            else:
+                ret_code = self.store.setup(
+                    self.config.local_hostname,
+                    self.config.metadata_server,
+                    per_tp_global_segment_size,
+                    per_tp_local_buffer_size,
+                    self.config.protocol,
+                    device_name,
+                    self.config.master_server_address,
+                )
             if ret_code:
                 logger.error(f"failed to setup mooncake store, error code: {ret_code}")
 
@@ -259,6 +297,12 @@ class MooncakeStore(HiCacheStorage):
         assert self.store.put(warmup_key, warmup_value) == 0
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
+
+    def alloc_from_mem_pool(self, size):
+        if self.config.standalone_storage:
+            return self.store.alloc_from_mem_pool(size)
+        else:
+            return None
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)

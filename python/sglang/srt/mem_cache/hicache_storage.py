@@ -54,6 +54,13 @@ class HiCacheStorage(ABC):
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
 
+    def alloc_from_mem_pool(self, size: int):
+        """
+        Alloc memory from the memory pool which can be used by storage backend for direct memory access.
+        Returns None if not supported.
+        """
+        return None
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
 

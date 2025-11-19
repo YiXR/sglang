@@ -3,9 +3,11 @@ import logging
 import threading
 from functools import wraps
 from typing import Optional
+import ctypes
 
 import psutil
 import torch
+import numpy as np
 
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import is_npu, is_xpu
@@ -91,7 +93,7 @@ class HostKVCache(abc.ABC):
                 f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
 
-        self.kv_buffer = self.init_kv_buffer()
+        # self.kv_buffer = self.init_kv_buffer()
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
@@ -197,18 +199,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
         )
-        self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
-        self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -220,7 +210,7 @@ class MHATokenToKVPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token() // 2
 
-    def init_kv_buffer(self):
+    def init_kv_buffer(self, external_buffer_ptr = None):
         if self.layout == "layer_first":
             dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
         elif self.layout == "page_first":
@@ -238,16 +228,41 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        buffer = torch.empty(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if external_buffer_ptr is not None:
+            try:
+                total_bytes = self.size * self.size_per_token
+                np_uint8_array = np.frombuffer(
+                    (ctypes.c_byte * total_bytes).from_address(external_buffer_ptr),
+                    dtype=np.uint8
+                )
+                uint8_tensor = torch.as_tensor(np_uint8_array)
+                buffer = uint8_tensor.view(self.dtype)
+                buffer = buffer.reshape(dims)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"Failed to create buffer from external memory: {str(e)}")
+        else:
+            buffer = torch.empty(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+            )
         if self.pin_memory:
             torch.cuda.cudart().cudaHostRegister(
                 buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
             )
-        return buffer
+        self.kv_buffer = buffer
+        self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+        self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
 
     @property
     def k_buffer(self):
@@ -504,12 +519,6 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
         )
-        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
@@ -526,7 +535,7 @@ class MLATokenToKVPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
-    def init_kv_buffer(self):
+    def init_kv_buffer(self, external_buffer_ptr = None):
         if self.layout == "layer_first":
             dims = (
                 self.layer_num,
@@ -555,16 +564,35 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.kv_lora_rank + self.qk_rope_head_dim
         ) * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        buffer = torch.empty(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if external_buffer_ptr is not None:
+            try:
+                total_bytes = self.size * self.size_per_token
+                np_uint8_array = np.frombuffer(
+                    (ctypes.c_byte * total_bytes).from_address(external_buffer_ptr),
+                    dtype=np.uint8
+                )
+                uint8_tensor = torch.as_tensor(np_uint8_array)
+                buffer = uint8_tensor.view(self.dtype)
+                buffer = buffer.reshape(dims)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"Failed to create buffer from external memory: {str(e)}")
+        else:
+            buffer = torch.empty(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+            )
         if self.pin_memory:
             torch.cuda.cudart().cudaHostRegister(
                 buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
             )
-        return buffer
+        self.kv_buffer = buffer
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
