@@ -93,6 +93,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    start_time: float = 0.0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -544,6 +545,7 @@ async def async_request_sglang_generate(
         st = time.perf_counter()
         most_recent_timestamp = st
         last_output_len = 0
+        output.start_time = st
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -2135,6 +2137,9 @@ async def benchmark(
             )
 
     result_details = {
+        "start_times": [output.start_time for output in outputs],
+        "latencies": [output.latency for output in outputs],
+        "timestamps": [getattr(output, 'start_time', 0) for output in outputs],
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
