@@ -480,6 +480,7 @@ class RadixCache(BasePrefixCache):
         return self._total_size_helper()
 
     def evict(self, num_tokens: int):
+        st = time.perf_counter()
         if self.disable:
             return
 
@@ -507,6 +508,7 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+        print(f"Evicted {num_evicted} tokens in {time.perf_counter() - st}s")
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
