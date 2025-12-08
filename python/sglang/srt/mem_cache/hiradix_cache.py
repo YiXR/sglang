@@ -62,6 +62,7 @@ class HiRadixCache(RadixCache):
                 hicache_size,
                 page_size,
                 hicache_mem_layout,
+                allocator_type = hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -70,6 +71,7 @@ class HiRadixCache(RadixCache):
                 hicache_size,
                 page_size,
                 hicache_mem_layout,
+                allocator_type = hicache_storage_backend,
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")

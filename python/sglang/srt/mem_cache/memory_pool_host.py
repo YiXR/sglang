@@ -6,6 +6,7 @@ from typing import Optional
 
 import psutil
 import torch
+import ctypes
 
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import is_npu, is_xpu
@@ -39,6 +40,53 @@ def synchronized(func):
     return wrapper
 
 
+class HostTensorAllocator(abc.ABC):
+    def __init__(self):
+        """Initialize the HostTensorAllocator."""
+        self.dtype = None
+        self.dims = None
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str = "cpu") -> torch.Tensor:
+        """Allocate a tensor of given dims and dtype on the host memory."""
+        self.dtype = dtype
+        self.dims = dims
+        tensor = torch.empty(dims, dtype=dtype, device=device)
+        return tensor
+
+class MooncakeHostTensorAllocator(HostTensorAllocator):
+    def __init__(self):
+        super().__init__()
+        from mooncake.store import HostMemAllocator
+        from sglang.srt.mem_cache.storage.mooncake_store import mooncake_store
+        self.allocator = HostMemAllocator()
+        self.ptr = None
+        self.default_local_buffer_size = mooncake_store.DEFAULT_LOCAL_BUFFER_SIZE
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str = "cpu") -> torch.Tensor:
+        """
+        Allocates memory using Mooncake's HostMemAllocator and wraps it in a PyTorch tensor.
+        """
+        self.dims = dims
+        self.dtype = dtype
+        size = 1
+        for d in dims:
+            size *= d
+        size *= torch.tensor([], dtype=self.dtype).element_size()
+        # Mooncake needs a local buffer for some reason, so we allocate extra space.
+        ptr_int = self.allocator.alloc(size + self.default_local_buffer_size)
+        self.ptr = ptr_int
+        c_type = ctypes.c_byte * size
+        c_array = c_type.from_address(ptr_int)
+
+        tensor = torch.frombuffer(c_array, dtype=torch.uint8, count=size)
+
+        if dtype != torch.uint8:
+            element_size = torch.tensor([], dtype=dtype).element_size()
+            assert size % element_size == 0, "Size must be divisible by element size"
+            tensor = tensor.view(dtype)
+
+        return tensor.view(dims)
+
 class HostKVCache(abc.ABC):
 
     def __init__(
@@ -50,12 +98,17 @@ class HostKVCache(abc.ABC):
         layout: str,
         pin_memory: bool,
         device: str,
+        allocator_type: str = "default",
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
+        if allocator_type == "mooncake":
+            self.allocator = MooncakeHostTensorAllocator()
+        else:
+            self.allocator = HostTensorAllocator()
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -187,6 +240,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         layout: str,
         pin_memory: bool = True,
         device: str = "cpu",
+        allocator_type: str = "default",
     ):
         super().__init__(
             device_pool,
@@ -196,6 +250,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             layout,
             pin_memory,
             device,
+            allocator_type,
         )
         self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
@@ -238,11 +293,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        buffer = torch.empty(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        buffer = self.allocator.allocate(dims, self.dtype, self.device)
         if self.pin_memory:
             torch.cuda.cudart().cudaHostRegister(
                 buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
@@ -494,6 +545,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         layout: str,
         pin_memory: bool = True,
         device: str = "cpu",
+        allocator_type: str = "default",
     ):
         super().__init__(
             device_pool,
@@ -503,6 +555,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             layout,
             pin_memory,
             device,
+            allocator_type,
         )
         self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
@@ -555,11 +608,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.kv_lora_rank + self.qk_rope_head_dim
         ) * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        buffer = torch.empty(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        buffer = self.allocator.allocate(dims, self.dtype, self.device)
         if self.pin_memory:
             torch.cuda.cudart().cudaHostRegister(
                 buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
